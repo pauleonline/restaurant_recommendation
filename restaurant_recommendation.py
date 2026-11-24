@@ -8,6 +8,7 @@ import json
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
+import requests
 
 import googlemaps
 from geopy.distance import geodesic as GD
@@ -37,7 +38,16 @@ OPENROUTER_MODELS = [
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "inclusionai/ling-3.0-flash:free",
     "openrouter/free",
+    # --- kostenpflichtige Modelle (Kosten pro Mio. Token als Kommentar) ---
+    "mistralai/mistral-nemo",       # 2c
+    "qwen/qwen3.7-flash",           # 3c
+    "deepseek/deepseek-v4-flash",   # 8c
+    "openai/gpt-5.6-luna",          # 10c
+    "xiaomi/mimo-v2.5",             # 11c
+    "deepseek/deepseek-v4-pro",     # 43c
+    "openai/gpt-5.5",               # 500c
 ]
+
 
 BUSINESS_COLS = ["name", "rating", "review", "price", "distance", "address", "category_list", "id"]
 HTML_COLS = [
@@ -74,6 +84,11 @@ description_prompt = ChatPromptTemplate.from_template(
     "{format_instructions}"
 )
 
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+POPULAR_URL = "https://openrouter.ai/api/frontend/models/find?order=top-weekly"
+SEPARATOR = "-" * 20
+N_PAID = 10
+
 ##############################################################################
 #  DATA / RESOURCE LOADING
 ##############################################################################
@@ -84,6 +99,57 @@ def get_openrouter_model(model_name: str, temperature: float) -> ChatOpenRouter:
     if not api_key: raise ValueError("OPENROUTER_API_KEY not found in environment/.env")
     return ChatOpenRouter(model=model_name, temperature=temperature, api_key=api_key)
 
+def _price_per_mio(m: dict) -> float | None:
+    """Prompt + Completion in USD pro Mio. Token (None/negativ = nicht nutzbar, z. B. Auto-Router)."""
+    p = m.get("pricing") or {}
+    try:                            return (float(p.get("prompt", 0)) + float(p.get("completion", 0))) * 1_000_000
+    except (TypeError, ValueError): return None
+
+def fetch_popularity_ranking() -> list[str]:
+    """Modell-IDs nach Nutzung (meistgenutzt zuerst). Leere Liste, falls nicht abrufbar."""
+    try:
+        r = requests.get(POPULAR_URL, timeout=30)
+        r.raise_for_status()
+        d = r.json().get("data", {})
+        models = d.get("models", []) if isinstance(d, dict) else d
+        return [m.get("slug") or m.get("id") for m in models if isinstance(m, dict)]
+    except Exception: return []
+
+@st.cache_resource(show_spinner=False)
+def build_openrouter_list(old_list: list[str], api_key: str | None = None,
+                          n_paid: int = N_PAID) -> tuple[list[str], list[str]]:
+    """Gibt (neue Liste, nicht mehr verfügbare Modelle aus old_list) zurück."""
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    resp = requests.get(OPENROUTER_MODELS_URL, headers=headers, timeout=30)
+    resp.raise_for_status()
+
+    # nur Modelle mit Text-Ausgabe und gültigem Preis
+    models = {}
+    for m in resp.json().get("data", []):
+        modalities = (m.get("architecture") or {}).get("output_modalities") or ["text"]
+        price = _price_per_mio(m)
+        if "text" in modalities and price is not None and price >= 0: models[m["id"]] = (m, price)
+
+    free = sorted(i for i, (_, p) in models.items() if p == 0)
+    paid = {i: p for i, (_, p) in models.items() if p > 0}
+
+    # 1) Modelle aus der alten Liste, die es noch (kostenpflichtig) gibt
+    keep = [i for i in dict.fromkeys(old_list) if i in paid]
+    gone = [i for i in old_list if i not in models]
+
+    # 2) Auffüllen mit den meistgenutzten Modellen (Varianten wie :nitro/:thinking auslassen)
+    ranking = fetch_popularity_ranking()
+    if ranking: candidates = [i for i in ranking if i in paid]
+    else:       candidates = sorted(paid, key=lambda i: models[i][0].get("created", 0), reverse=True)
+    for i in candidates:
+        if len(keep) >= n_paid:            break
+        if i not in keep and ":" not in i: keep.append(i)
+
+    keep.sort(key=lambda i: paid[i])
+    return free + [SEPARATOR] + keep, gone
+
+OPENROUTER_MODELS, _ = build_openrouter_list(OPENROUTER_MODELS, api_key=None)
+    
 ##############################################################################
 #  LLM HELPERS
 ##############################################################################
